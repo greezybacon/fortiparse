@@ -293,6 +293,85 @@ def sanitize(config, pwds=True, ips=True):
             elif ips and ipv4addr.search(props[0]):
             	config[section] = scrub_ipset(props)
 
+# ---- Difference Engine ----------------------
+Undefined = object()
+
+def print_diff_value(name, left, right, prefix="", output=sys.stdout,
+        header=None):
+
+    def send_header(name):
+        header_is_out = False
+        def deferred():
+            nonlocal header_is_out
+            if not header_is_out:
+                if header is not None:
+                    header()
+                if isinstance(name, Config):
+                    output.write("  %sconfig %s\n" % (prefix, name))
+                else:
+                    output.write("  %sedit %s\n" % (prefix, quote(name,
+                        force=not is_number(name))))
+                header_is_out = True
+        return deferred
+
+    diffs = 0
+    if type(left) is dict:
+        changes = print_diff_section(left, right, prefix + "    ",
+            output, send_header(name))
+        if changes > 0:
+            if isinstance(name, Config):
+                output.write("  %send\n" % (prefix,))
+            else:
+                output.write("  %snext\n" % (prefix,))
+        diffs += changes
+    elif left != right:
+        if header is not None:
+            header()
+        diffs += 1
+        if left is None:
+            output.write("- %sunset %s\n" % (prefix, name,))
+        elif left is not Undefined:
+            output.write("- %sset %s %s\n" % (prefix, name, " ".join(
+quote(x) for x in left)))
+
+        if right is None:
+            output.write("+ %sunset %s\n" % (prefix, name,))
+        elif right is not Undefined:
+            output.write("+ %sset %s %s\n" % (prefix, name, " ".join(
+quote(x) for x in right)))
+
+    return diffs
+
+def print_diff_section(left, right, prefix="", output=sys.stdout,
+        header=None):
+
+    diffs = 0
+    for name, value in left.items():
+        if right is Undefined or name not in right:
+            rvalue = Undefined
+        else:
+            rvalue = right[name]
+
+        diffs += print_diff_value(name, value, rvalue, prefix, output, header)
+
+    # And for all the keys missing in the left (or added in the right)
+    if type(right) is dict:
+        for k in set(right.keys()) - set(left.keys()):
+            rvalue = right[k]
+            lvalue = None
+            if type(rvalue) is dict:
+                lvalue = dict((j, Undefined) for j in rvalue)
+            diffs += print_diff_value(k, lvalue, rvalue, prefix, output, header)
+
+    return diffs
+
+def print_diffs(configs, output=sys.stdout):
+    if len(configs) == 1:
+        raise Exception('At least two configs required for diffing')
+    left, right = configs[0], configs[1]
+
+    print_diff_section(left, right, "", output)
+
 # ---- Argument Handling ----------------------
 
 section_maps = {
@@ -319,6 +398,8 @@ parser.add_argument('--vdom', type=str,
 parser.add_argument('--merge', type=str, nargs='+',
     help="List of sections to merge", default=[],
     choices=section_maps.keys())
+parser.add_argument('--diff', default=False, action='store_true',
+    help="Produce a report of differences between the configs")
 parser.add_argument('--get', type=str, help="Extract a single section from the "
     "configuration. Use the text after the token `config`, so `firewall policy` "
     "for instance")
@@ -371,6 +452,9 @@ def main():
                 if args.vdom and 'vdom' in r:
                     r = r.get('vdom').get(args.vdom) or r
                 l[Config(name)] = merge_section(l, r, name)
+
+    if args.diff:
+        return print_diffs(configs)
 
     # Fetch the left-most config
     left = configs[0]
