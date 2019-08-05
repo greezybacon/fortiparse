@@ -102,6 +102,19 @@ class StrippedConfig(object):
     def pushback(self, line):
         self.buffer.append(line)
 
+def merging_dict(tuples):
+    """Extension to dict() which handles repeating keys"""
+    rv = dict()
+    for k, v in tuples:
+        if k in rv:
+            rv[k].update(v)
+        else:
+            rv[k] = v
+    return rv
+
+def parse_config(file):
+    return merging_dict(iter_sections(StrippedConfig(file)))
+
 # ---- Output ----------------
 
 def is_number(x):
@@ -181,7 +194,7 @@ def print_csv(section, output=sys.stdout):
     for id, props in section.items():
         row = props.copy()
         row.update({'id': (id,)})
-        writer.writerow({k: "; ".join(x for x in v) for k, v in row.items()})
+        writer.writerow({k: "; ".join(x for x in v) if v else None for k, v in row.items()})
 
 # ---- Config Merging ------------------------
 
@@ -216,33 +229,49 @@ def merge_section(left, right, name):
     return merge_section_left(left.get(name), right.get(name), 'uuid')
 
 def translate_interfaces(config, ifmap):
+    # Recurse for DICT, replace for TUPLE, and passthrough otherwise
     return dict((
         ifmap[k] if k in ifmap else k,
-                 translate_interfaces(v, ifmap) if type(v) is dict
-            else tuple(ifmap[p] if p in ifmap else p for p in v) if type(v) is tuple
-            else v
+        translate_interfaces(v, ifmap)
+            if type(v) is dict
+            else tuple(ifmap[p] if p in ifmap else p for p in v)
+                if type(v) is tuple
+                else v
         ) for k, v in config.items()
     )
 
 # ---- Pre-flight checks ----------------------
-
+ipv4addr = re.compile(r'\b((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|\b)){4}\b')
 def scrub_ipset(props):
-    # TODO: Handle IP ranges (a.b.c.d-a.b.c.e)
     # TODO: Handle IP/mask (used in `router policy`)
     if len(props) > 1:
-        return (sanitize_ip(props[0], props[1]), props[1])
+        return (sanitize_ip(props[0], props[1]), *props[1:])
     else:
-        return (sanitize_ip(props[0]),)
+        value = props[0]
+        for m in ipv4addr.finditer(props[0]):
+            value = value[:m.start()] + sanitize_ip(m.group(0)) + value[m.end():]
+        return (value,)
 
 snetworks = {}
 def sanitize_ip(ip, mask='255.255.255.0'):
     iip = ip_number(ip)
     imask = ip_number(mask)
+    if imask == 4294967295:
+        # Search the snetworks table for the network
+        imask2 = imask
+        for m in range(1, 24):
+            imask2 = (imask2 << 1) & 0xffffffff
+            if iip & imask2 in snetworks:
+                imask = imask2
+                break
+        else:
+            # assume 24-bit
+            imask = 0xffffff00
     network = iip & imask
     host = iip & ~imask
     if network not in snetworks:
         snetworks[network] = (10 << 24) + (random.randint(1<<8, (1<<24) - 1) & imask)
-    return ip_repr(snetworks[network] | host)
+    return ip_repr(snetworks[network] + host)
 
 def ip_number(ip, mask='255.255.255.255'):
     net = 0
@@ -253,16 +282,15 @@ def ip_number(ip, mask='255.255.255.255'):
 def ip_repr(ip):
     return '.'.join([str((ip >> i) & 255) for i in range(24, -1, -8)])
 
-is_ipaddress = lambda x: re.match(r'\d+(?:\.\d+){3}$', x)
 def sanitize(config, pwds=True, ips=True):
     for section, props in config.items():
         if type(props) is dict:
             sanitize(props, pwds, ips)
         elif type(props) is tuple:
             if pwds and props[0] == 'ENC':
-                config[section] = ('ENC', '*REDACTED*',)
+                config[section] = ('ENC', 'REDACTED=',)
             # TODO: Pick numbers for networks
-            elif ips and is_ipaddress(props[0]):
+            elif ips and ipv4addr.search(props[0]):
             	config[section] = scrub_ipset(props)
 
 # ---- Argument Handling ----------------------
@@ -278,7 +306,7 @@ section_maps = {
         'firewall ippool', 'firewall ldb-monitor', 'firewall vip',
         'firewall profile-protocol-options', 'firewall ssl-ssh-profile',
         'firewall policy',),
-    'vpns':         ('antivirus profile',),
+    'vpns':         ('vpn ipsec phase1-interface', 'vpn ipsec phase2-interface'),
     'routes':       ('router static',),
 }
 
@@ -307,69 +335,62 @@ parser.add_argument('--ifmap', nargs="+",
 parser.add_argument('--csv', action="store_true",
     help="Used with --get, return results as a CSV file")
 
-args = parser.parse_args()
-
 # ---- The main thing -------------------------
 
-def merging_dict(tuples):
-    """Extension to dict() which handles repeating keys"""
-    rv = dict()
-    for k, v in tuples:
-        if k in rv:
-            rv[k].update(v)
+def main():
+    args = parser.parse_args()
+
+    configs = []
+    # Parse all the configurations
+    for file in args.file:
+        if file == "-":
+            file = sys.stdin
         else:
-            rv[k] = v
-    return rv
+            file = open(file, "rt")
+        sys.stderr.write("# Parsing configuration : %s\n" % (file.name,))
+        configs.append(parse_config(file))
 
-configs = []
-# Parse all the configurations
-for file in args.file:
-    if file == "-":
-        file = sys.stdin
+    # Translate interface names
+    if args.ifmap:
+        ifmap = dict(m.split(':', 1) for m in args.ifmap)
+        configs[1:] = [translate_interfaces(x, ifmap) for x in configs[1:]]
+
+    # Perform merging as requested
+    for s in section_maps.keys():
+        if s not in args.merge:
+            continue
+        sys.stderr.write(">>> Merging %s\n" % (s,))
+        l, right = configs[0], configs[1:]
+
+        # Support VDOM option
+        if args.vdom is not None and 'vdom' in l:
+            l = l.get('vdom').get(args.vdom)
+        for name in section_maps[s]:
+            sys.stderr.write("    ... section %s\n" % (name,))
+            for r in right:
+                if args.vdom and 'vdom' in r:
+                    r = r.get('vdom').get(args.vdom) or r
+                l[Config(name)] = merge_section(l, r, name)
+
+    # Fetch the left-most config
+    left = configs[0]
+
+    if args.sanitize:
+        sanitize(left, 'pwds' in args.sanitize, 'ips' in args.sanitize)
+
+    # Pull the requested section, if any
+    if args.get is not None:
+        if args.vdom is not None and 'vdom' in left:
+            left = left.get('vdom').get(args.vdom)
+        left = {Config(args.get): left.get(args.get)}
+
+    # Output the left-most config
+    if not args.csv:
+        pretty_print_config(left)
+    elif args.get:
+        print_csv(left.get(args.get))
     else:
-        file = open(file, "rt")
-    sys.stderr.write("# Parsing configuration : %s\n" % (file.name,))
-    configs.append(merging_dict(iter_sections(StrippedConfig(file))))
+        sys.stderr.write("!!! Must use --get with --csv\n")
 
-# Translate interface names
-if args.ifmap:
-    ifmap = dict(m.split(':', 1) for m in args.ifmap)
-    configs[1:] = [translate_interfaces(x, ifmap) for x in configs[1:]]
-
-# Perform merging as requested
-for s in section_maps.keys():
-    if s not in args.merge:
-        continue
-    sys.stderr.write(">>> Merging %s\n" % (s,))
-    l, right = configs[0], configs[1:]
-
-    # Support VDOM option
-    if args.vdom is not None and 'vdom' in l:
-        l = l.get('vdom').get(args.vdom)
-    for name in section_maps[s]:
-        sys.stderr.write("    ... section %s\n" % (name,))
-        for r in right:
-            if args.vdom and 'vdom' in r:
-                r = r.get('vdom').get(args.vdom) or r
-            l[Config(name)] = merge_section(l, r, name)
-
-# Fetch the left-most config
-left = configs[0]
-
-if args.sanitize:
-    print(args.sanitize)
-    sanitize(left, 'pwds' in args.sanitize, 'ips' in args.sanitize)
-
-# Pull the requested section, if any
-if args.get is not None:
-    if args.vdom is not None and 'vdom' in left:
-        left = left.get('vdom').get(args.vdom)
-    left = {Config(args.get): left.get(args.get)}
-    
-# Output the left-most config
-if not args.csv:
-    pretty_print_config(left)
-elif args.get:
-    print_csv(left.get(args.get))
-else:
-    sys.stderr.write("!!! Must use --get with --csv\n")
+if __name__ == '__main__':
+    main()
