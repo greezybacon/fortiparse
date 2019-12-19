@@ -9,11 +9,12 @@ import shlex
 import sys
 import warnings
 
+esc_quote = re.compile(r'(?<!\\)\\"')
+
 # ---- Config parsing --------------------------
 class Config(str):
     "Config is a marker to indicate that `config` should be used in the output"
     "rather than `edit`"
-    pass
 
 def read_unset(start_line, config):
     _, var = start_line.split(' ', 1)
@@ -22,10 +23,10 @@ def read_unset(start_line, config):
 def read_set(start_line, config):
     global keywords
     _, var, value = start_line.split(' ', 2)
-    while (value.count('"') - value.count('\\"')) % 2 == 1:
+    while (value.count('"') - len(list(esc_quote.findall(value)))) % 2 == 1:
         line = next(config)
         if line.startswith('set') or line.startswith('end'):
-            raise SyntaxError("Corrupt config?: [%d] %s" % (config.line_number, line))
+            raise SyntaxError("Corrupt config? (not expecting `set` or `end`): [%d] %s" % (config.line_number, line))
         value += "\n" + line
     return var, tuple(x.strip('"') for x in shlex.split(value))
 
